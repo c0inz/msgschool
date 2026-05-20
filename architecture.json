@@ -1,0 +1,1458 @@
+{
+  "spec": "spaiglass-architecture/1",
+  "specUrl": "https://spaiglass.xyz/architecture-manual",
+  "generatedAt": "2026-05-04T12:00:00Z",
+  "generatedBy": "claude-code",
+  "generatorVersion": "claude-opus-4-7",
+  "_methodology": "Observed live state via SSH on 2026-05-04. Hierarchy applied per manual: code → running processes → DB state → URLs → filesystem. Internal RFC1918 LAN IPs are placeheld as <vm-ip> / <lan-host-ip> to match the public repo's scrub policy; physical addressing is not load-bearing for the architectural model. Real values exist on the operating host.",
+  "project": {
+    "name": "MsgSchool",
+    "slug": "msgschool",
+    "version": "0.1.0",
+    "git": {
+      "commit": "2bd0573509adcfcb62abf80dbc43ee8c08da8d8b",
+      "branch": "main",
+      "remote": "https://github.com/c0inz/msgschool.git",
+      "signedBy": null,
+      "dirty": false
+    },
+    "owner": "John Davenport",
+    "maintainers": [
+      "John Davenport"
+    ],
+    "licenseId": "MIT",
+    "createdAt": "2026-04-19T00:00:00Z",
+    "lastDeployAt": "2026-05-04T00:35:40Z",
+    "lastDeployBy": "scripts/install-toolsd.sh",
+    "domain": "msgschool.com",
+    "status": "ok",
+    "statusSource": {
+      "command": "systemctl is-active msgschool.service msgschool-toolsd.service",
+      "output": "active\\nactive",
+      "observedAt": "2026-05-04T11:59:46Z"
+    }
+  },
+  "hosts": [
+    {
+      "id": "msgschool-vm",
+      "name": "msgschool",
+      "kind": "linux-vm",
+      "platform": "Ubuntu 24.04.3 LTS / Linux 6.8.0",
+      "virtualization": "kvm/libvirt on host <kvm-host>",
+      "address": "<vm-ip> (RFC1918 LAN, not internet-reachable)",
+      "purpose": "single-tenant production host for the msgschool Telegram bot, the toolsd daemon, postgres, and the Cloudflare tunnel that exposes the webhook.",
+      "lastBootAt": "2026-05-04T00:35:37Z",
+      "uptimeSource": {
+        "command": "systemctl show ... ActiveEnterTimestamp",
+        "observedAt": "2026-05-04T11:59:46Z"
+      }
+    },
+    {
+      "id": "<kvm-host>",
+      "name": "the KVM host",
+      "kind": "linux-kvm-host",
+      "platform": "Ubuntu 24.04 / Linux 6.8.0",
+      "address": "<lan-host-ip> (RFC1918 LAN)",
+      "purpose": "physical KVM host that runs the msgschool VM. Also the rsync target for nightly age-encrypted backups (forced-command SSH only). Hosts ~7 other VMs unrelated to msgschool.",
+      "uptimeApproxDays": 42,
+      "uptimeSource": {
+        "command": "uptime",
+        "observedAt": "2026-05-03T17:50:09Z"
+      }
+    }
+  ],
+  "components": [
+    {
+      "id": "msgschool",
+      "name": "msgschool — Telegram webhook + landing pages",
+      "type": "api-server",
+      "description": "Next.js 16 app (App Router) that serves the public site (/, /privacy, /terms, /security) and the Telegram webhook (POST /api/bot/webhook). The webhook is the single entry point for user-facing traffic: it validates the Telegram secret-token header, runs the inbound credential scrubber, dispatches active sessions to OpenClaw, and runs the outbound credential scrubber on every reply before sendMessage. If down: Telegram retries the webhook for up to 24 hours; messages received during the outage land late but not lost; the public site returns 502.",
+      "runsOn": [
+        "msgschool-vm"
+      ],
+      "processName": "next-server",
+      "systemdUnit": "msgschool.service",
+      "pm2Id": null,
+      "pid": 1116,
+      "command": "/usr/bin/npx next start -H 127.0.0.1 -p 3010",
+      "workingDir": "/var/www/msgschool",
+      "env": [
+        "DATABASE_URL",
+        "NEXT_PUBLIC_SITE_URL",
+        "NEXT_PUBLIC_TELEGRAM_BOT_HANDLE",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_WEBHOOK_SECRET",
+        "USER_WORKSPACE_ROOT",
+        "PROVISION_SCRIPT",
+        "DEPROVISION_SCRIPT",
+        "FREE_CODE",
+        "FREE_CODE_PERIOD_DAYS",
+        "PRICE_USD_PER_MONTH",
+        "PORT",
+        "NODE_ENV",
+        "CREDENTIAL_CAPTURE",
+        "MSGSCHOOL_GATE_ENABLED"
+      ],
+      "port": 3010,
+      "bindAddress": "127.0.0.1",
+      "language": "TypeScript",
+      "runtime": "node",
+      "runtimeVersion": "v22.x",
+      "codePath": "/var/www/msgschool/src",
+      "startedAt": "2026-05-04T00:35:40Z",
+      "restartCount": "unknown — systemd does not surface this without parsing journal",
+      "memoryRssMb": 161,
+      "cpuPct": 0.0,
+      "logPath": "journalctl -u msgschool",
+      "dependsOn": [
+        "postgresql",
+        "openclaw-gateway",
+        "cloudflared",
+        "telegram-api"
+      ],
+      "purpose": "the single user-facing surface of the product; everything else is plumbing",
+      "expectedLoad": "≤4 questions/day per user × current 4 users ≈ 16 webhook calls/day. Modeled to 600 users (~2400/day) for capacity planning.",
+      "provenLoad": "244 ms_messages rows total since 2026-04-19 — average ~16 messages/day across 4 users. Source: SELECT count(*) FROM ms_messages.",
+      "status": "ok",
+      "statusSource": {
+        "command": "systemctl is-active msgschool.service",
+        "output": "active",
+        "observedAt": "2026-05-04T11:59:46Z"
+      }
+    },
+    {
+      "id": "msgschool-toolsd",
+      "name": "msgschool-toolsd — Canvas + Skyward tool daemon",
+      "type": "api-server",
+      "description": "Long-running Node service that holds decrypted Canvas/Skyward credentials in process memory only and exposes a unix-socket JSON-RPC surface (canvas.list_courses, canvas.get_pulse, skyward.get_grades, skyward.get_attendance, pulse.combined, tools.healthcheck, ...). The agent calls in via /usr/local/bin/ms_call. Holds plaintext creds for ≤10 minutes per user (LRU cache). On startup, hydrates every user's tmpfs creds from on-disk ciphertext via ensureAllUsersHydrated(); without this, a reboot leaves users with empty tmpfs and silently broken Canvas/Skyward fetches (incident 2026-05-01). If down: every Canvas/Skyward read fails with INTERNAL/transport-error; bot replies still work; agent has no usable data.",
+      "runsOn": [
+        "msgschool-vm"
+      ],
+      "processName": "node",
+      "systemdUnit": "msgschool-toolsd.service",
+      "pid": 795,
+      "command": "/usr/bin/node --experimental-strip-types /var/www/msgschool/src/lib/toolsd/server.ts",
+      "workingDir": "/var/www/msgschool",
+      "env": [
+        "MSGSCHOOL_TOOLSD_SOCKET",
+        "MSGSCHOOL_CRED_TMPFS_ROOT",
+        "MSGSCHOOL_CHROMIUM_PATH",
+        "DATABASE_URL"
+      ],
+      "port": null,
+      "bindAddress": "/run/msgschool/toolsd.sock (unix domain socket, mode 0666 root:root)",
+      "language": "TypeScript",
+      "runtime": "node",
+      "runtimeVersion": "v22.x",
+      "codePath": "/var/www/msgschool/src/lib/toolsd",
+      "startedAt": "2026-05-04T00:35:38Z",
+      "memoryRssMb": 96,
+      "cpuPct": 0.0,
+      "logPath": "journalctl -u msgschool-toolsd",
+      "dependsOn": [
+        "postgresql",
+        "canvas-api",
+        "skyward-portal",
+        "openclaw-bundled-chromium"
+      ],
+      "purpose": "the structural-ish boundary that keeps credential plaintext out of the LLM agent's process. v1 caveat: agent and toolsd run as the same Linux UID (root), so the isolation is behavioral (playbook rules + outbound scrubber + credscan) rather than structural per-UID. Per-UID work blocked on OpenClaw setuid support.",
+      "expectedLoad": "≤8 tool calls per user per question; ~30/min steady at scale",
+      "provenLoad": "17 ms_tool_calls rows since wired 2026-05-01. Source: SELECT count(*) FROM ms_tool_calls.",
+      "status": "ok",
+      "statusSource": {
+        "command": "systemctl is-active msgschool-toolsd.service && /usr/local/bin/ms_call tools.healthcheck '{}'",
+        "output": "active; {\"v\":1,\"result\":{\"toolsd_version\":\"0.1.0\",...}}",
+        "observedAt": "2026-05-04T11:59:46Z"
+      }
+    },
+    {
+      "id": "openclaw-gateway",
+      "name": "openclaw-gateway — agent runtime",
+      "type": "api-server",
+      "description": "OpenClaw gateway that runs each user's LLM agent. msgschool dispatches to it via a local TCP loopback (127.0.0.1:18789 / :18791). Loads the per-user workspace at /opt/msgschool/users/canvasagent-<tg_id>/workspace and runs the agent against the configured LLM provider chain (see `llmModels.rotation` below for the current primary + fallback). If down: every active-state Telegram message hits the bot but produces no agent reply; bot logs `<dispatch failed>`.",
+      "runsOn": [
+        "msgschool-vm"
+      ],
+      "processName": "node",
+      "systemdUnit": "openclaw-gateway (systemd --user under uid=0)",
+      "pid": 147693,
+      "command": "openclaw-gateway",
+      "workingDir": "/root/.openclaw",
+      "env": [
+        "unknown (managed by openclaw, not by msgschool .env)"
+      ],
+      "port": 18789,
+      "bindAddress": "127.0.0.1",
+      "language": "TypeScript",
+      "runtime": "node (bundled)",
+      "runtimeVersion": "openclaw 2026.5.3-1 (2eae30e)",
+      "codePath": "/usr/lib/node_modules/openclaw",
+      "_versionUpgradeNote": "Upgraded 2026-05-04 from 2026.4.15 (041266a) to 2026.5.3-1 after release-notes review for session-jsonl/usage-block compatibility, [SYSTEM] prompt convention, gateway socket layout, and openclaw.json schema. No regressions observed; live canvas.connectivity_probe ok in 452ms post-restart.",
+      "startedAt": "2026-05-04T21:39:00Z",
+      "memoryRssMb": 481,
+      "cpuPct": 0.3,
+      "logPath": "sudo XDG_RUNTIME_DIR=/run/user/0 journalctl --user -u openclaw-gateway",
+      "dependsOn": [
+        "moonshot-api"
+      ],
+      "purpose": "third-party agent runtime; we don't own its source. msgschool treats it as a black box that consumes [SYSTEM] prompts and emits replies.",
+      "expectedLoad": "matches msgschool inbound (≤16 turns/day current)",
+      "provenLoad": "matches msgschool — every active inbound triggers exactly one openclaw turn",
+      "status": "ok",
+      "statusSource": {
+        "command": "XDG_RUNTIME_DIR=/run/user/0 systemctl --user is-active openclaw-gateway",
+        "output": "active",
+        "observedAt": "2026-05-04T11:59:46Z"
+      }
+    },
+    {
+      "id": "msgschool-credscan",
+      "name": "msgschool-credscan — periodic credential leak sweeper",
+      "type": "cron",
+      "description": "Systemd-timer-driven sweep that runs every 2 minutes. For each agent workspace, reads the user's currently-loaded credential strings from /run/msgschool/<agent>/<svc>.json, greps every text-shaped file in the workspace for those literal bytes, replaces matches in place with [redacted-credscan]. Also scans OpenClaw session jsonls and warns to journalctl if any credential-shaped lines appear (those can't be live-edited). If down: workspaces accumulate any credential bytes the inbound/outbound scrubbers happened to miss; outbound scrubber + behavioral playbook rules still hold.",
+      "runsOn": [
+        "msgschool-vm"
+      ],
+      "processName": "msgschool-credscan",
+      "systemdUnit": "msgschool-credscan.timer + msgschool-credscan.service",
+      "pid": null,
+      "command": "/usr/local/sbin/msgschool-credscan",
+      "workingDir": "/usr/local/sbin",
+      "env": [],
+      "port": null,
+      "bindAddress": null,
+      "language": "bash",
+      "runtime": "bash",
+      "runtimeVersion": "5.2",
+      "codePath": "/var/www/msgschool/scripts/credscan.sh",
+      "startedAt": "2026-05-04T00:35:37Z (timer enabled at boot, fires every 120s)",
+      "memoryRssMb": 0,
+      "cpuPct": 0.0,
+      "logPath": "journalctl -t credscan",
+      "dependsOn": [
+        "msgschool-toolsd (for tmpfs creds)"
+      ],
+      "purpose": "defense-in-depth net under the inbound + outbound scrubbers. Catches credential bytes that landed in workspace files (USER.md, MEMORY.md, agent-written scripts) before they end up in a backup tarball.",
+      "expectedLoad": "fires 720× per day; each run does up to a few hundred grep ops",
+      "provenLoad": "unknown — timer logs to journalctl with tag=credscan",
+      "status": "ok",
+      "statusSource": {
+        "command": "systemctl is-active msgschool-credscan.timer",
+        "output": "active",
+        "observedAt": "2026-05-04T11:59:46Z"
+      }
+    },
+    {
+      "id": "msgschool-purge-archived",
+      "name": "msgschool-purge-archived — daily 30-day purge",
+      "type": "cron",
+      "description": "Systemd-timer-driven daily purge of workspace archives older than 30 days. Backs the privacy promise that deletion-archived workspaces are auto-purged after 30 days. If down: the .archive_pre_toolsd_* (and similar) directories grow indefinitely; eventually bites disk.",
+      "runsOn": [
+        "msgschool-vm"
+      ],
+      "processName": "msgschool-purge-archived",
+      "systemdUnit": "msgschool-purge-archived.timer + msgschool-purge-archived.service",
+      "pid": null,
+      "command": "scripts/purge-archived.sh",
+      "workingDir": "/var/www/msgschool",
+      "env": [],
+      "port": null,
+      "bindAddress": null,
+      "language": "bash",
+      "runtime": "bash",
+      "codePath": "/var/www/msgschool/scripts/purge-archived.sh",
+      "startedAt": "2026-05-04T00:35:37Z (timer enabled, fires daily 00:00 UTC)",
+      "memoryRssMb": 0,
+      "cpuPct": 0.0,
+      "logPath": "journalctl -u msgschool-purge-archived",
+      "dependsOn": [],
+      "purpose": "the cron half of the user-facing /delete privacy promise",
+      "expectedLoad": "1 run/day, seconds of work",
+      "provenLoad": "unknown",
+      "status": "ok",
+      "statusSource": {
+        "command": "systemctl is-active msgschool-purge-archived.timer",
+        "output": "active",
+        "observedAt": "2026-05-04T11:59:46Z"
+      }
+    },
+    {
+      "id": "postgresql",
+      "name": "postgresql 16 — application database",
+      "type": "db",
+      "description": "Local PostgreSQL 16 instance bound to 127.0.0.1 only. Holds the bot's user/state/message/audit tables (ms_*) plus legacy OCMarketplace tables that share the database. If down: webhook handler 500s on every inbound; agent dispatch fails; recoveries via the daily age-encrypted dump.",
+      "runsOn": [
+        "msgschool-vm"
+      ],
+      "processName": "postgres",
+      "systemdUnit": "postgresql@16-main.service",
+      "pid": 923,
+      "command": "/usr/lib/postgresql/16/bin/postgres -D /var/lib/postgresql/16/main -c config_file=/etc/postgresql/16/main/postgresql.conf",
+      "workingDir": "/var/lib/postgresql/16/main",
+      "env": [],
+      "port": 5432,
+      "bindAddress": "127.0.0.1, [::1]",
+      "language": "C",
+      "runtime": "postgres",
+      "runtimeVersion": "16.13",
+      "codePath": "(packaged)",
+      "startedAt": "2026-05-04T00:35:40Z",
+      "memoryRssMb": 31,
+      "cpuPct": 0.0,
+      "logPath": "journalctl -u postgresql@16-main",
+      "dependsOn": [],
+      "purpose": "single source of truth for user state, message log, audit trails",
+      "expectedLoad": "small — ~hundreds of writes per day at current scale, modeled to ~10k/day at 600 users",
+      "provenLoad": "9015 kB total db size, 244 ms_messages rows",
+      "status": "ok",
+      "statusSource": {
+        "command": "systemctl is-active postgresql@16-main.service && pg_isready -h 127.0.0.1 -p 5432",
+        "output": "active",
+        "observedAt": "2026-05-04T11:59:46Z"
+      }
+    },
+    {
+      "id": "cloudflared",
+      "name": "cloudflared — Cloudflare tunnel",
+      "type": "gateway",
+      "description": "Outbound-only Cloudflare tunnel that connects the msgschool VM to Cloudflare's edge so that msgschool.com (and the Telegram webhook) can reach the Next.js process on 127.0.0.1:3010 without opening any inbound port. Runs under a dedicated 'cloudflared' system user (uid 999) since 2026-05-04. If down: msgschool.com returns 5xx via Cloudflare; the Telegram webhook fails; messages queue at Telegram for up to 24h.",
+      "runsOn": [
+        "msgschool-vm"
+      ],
+      "processName": "cloudflared",
+      "systemdUnit": "cloudflared.service",
+      "_systemdUnitDropIn": "/etc/systemd/system/cloudflared.service.d/user.conf — sets User=cloudflared Group=cloudflared AmbientCapabilities=CAP_NET_BIND_SERVICE",
+      "pid": "respawned 2026-05-04",
+      "user": "cloudflared",
+      "command": "/usr/local/bin/cloudflared --no-autoupdate tunnel run",
+      "workingDir": "/etc/cloudflared",
+      "env": [],
+      "port": 20241,
+      "bindAddress": "127.0.0.1 (local metrics endpoint; outbound to Cloudflare edge)",
+      "language": "Go",
+      "runtime": "cloudflared",
+      "runtimeVersion": "unknown — installed via Cloudflare's apt repo",
+      "codePath": "(packaged)",
+      "startedAt": "2026-05-04T13:19:00Z",
+      "memoryRssMb": 38,
+      "cpuPct": 0.2,
+      "logPath": "journalctl -u cloudflared",
+      "dependsOn": [
+        "msgschool"
+      ],
+      "purpose": "ingress without inbound firewall holes",
+      "expectedLoad": "matches msgschool; tunnel pushes Telegram traffic",
+      "provenLoad": "unknown — Cloudflare dashboard would show",
+      "status": "ok",
+      "statusSource": {
+        "command": "systemctl is-active cloudflared.service",
+        "output": "active",
+        "observedAt": "2026-05-04T11:59:46Z"
+      }
+    }
+  ],
+  "connections": [
+    {
+      "from": "telegram-api",
+      "to": "cloudflared",
+      "kind": "inbound-http",
+      "description": "Telegram POSTs to https://msgschool.com/api/bot/webhook with x-telegram-bot-api-secret-token header. Cloudflare edge → tunnel → 127.0.0.1:3010."
+    },
+    {
+      "from": "cloudflared",
+      "to": "msgschool",
+      "kind": "loopback-http",
+      "description": "Tunnel forwards to 127.0.0.1:3010"
+    },
+    {
+      "from": "msgschool",
+      "to": "postgresql",
+      "kind": "loopback-pg",
+      "description": "DATABASE_URL points at 127.0.0.1:5432, db=msgschool, user=msgschool"
+    },
+    {
+      "from": "msgschool",
+      "to": "openclaw-gateway",
+      "kind": "loopback-http",
+      "description": "Active-state messages dispatched via the gateway's local HTTP endpoint :18789"
+    },
+    {
+      "from": "openclaw-gateway",
+      "to": "moonshot-api",
+      "kind": "outbound-https",
+      "description": "Primary + fallback both route to Moonshot AI's Kimi platform (K2.6 primary, K2.5 fallback as of 2026-05-13). When the routing changes, regenerate this block and the llmModels.rotation section together."
+    },
+    {
+      "from": "openclaw-gateway",
+      "to": "msgschool-toolsd",
+      "kind": "subprocess",
+      "description": "ms_call wrapper invoked from the agent's bash tool; talks to /run/msgschool/toolsd.sock"
+    },
+    {
+      "from": "msgschool-toolsd",
+      "to": "canvas-api",
+      "kind": "outbound-https",
+      "description": "REST fetches against <district>.instructure.com with Bearer token from credentials/canvas.json (in-memory only)"
+    },
+    {
+      "from": "msgschool-toolsd",
+      "to": "skyward-portal",
+      "kind": "outbound-https-playwright",
+      "description": "Headless Chromium login + DOM scrape against student.<district>.org"
+    },
+    {
+      "from": "msgschool-toolsd",
+      "to": "postgresql",
+      "kind": "loopback-pg",
+      "description": "Audit row INSERT into ms_tool_calls per request"
+    },
+    {
+      "from": "msgschool-vm",
+      "to": "<kvm-host>",
+      "kind": "outbound-rsync-over-ssh",
+      "description": "Daily age-encrypted backups (db dump + workspaces + config). the KVM host side accepts only the rsync forced-command — verified 2026-05-01."
+    }
+  ],
+  "siteMap": {
+    "kind": "web",
+    "routes": [
+      {
+        "path": "/",
+        "method": [
+          "GET"
+        ],
+        "component": "src/app/page.tsx:default",
+        "title": "MsgSchool",
+        "description": "Public landing page. Hero + privacy stripe + How-it-works + capabilities grid + CTA.",
+        "kind": "page",
+        "auth": "public",
+        "incomingLinks": [],
+        "orphan": false,
+        "lastModified": "2026-05-03",
+        "hits7d": "unknown — no analytics layer wired",
+        "status": "live",
+        "featureFlag": null
+      },
+      {
+        "path": "/security",
+        "method": [
+          "GET"
+        ],
+        "component": "src/app/security/page.tsx:default",
+        "title": "Security — MsgSchool",
+        "description": "Public security architecture page. Documents the four defense layers, what we cannot defend against, and what to do on a credential leak. Linked from header, footer, and the home-page privacy stripe.",
+        "kind": "page",
+        "auth": "public",
+        "incomingLinks": [
+          {
+            "from": "/",
+            "kind": "nav-link"
+          },
+          {
+            "from": "/",
+            "kind": "footer-link"
+          },
+          {
+            "from": "/",
+            "kind": "privacy-stripe-cta"
+          },
+          {
+            "from": "/privacy",
+            "kind": "nav-link"
+          },
+          {
+            "from": "/privacy",
+            "kind": "inline-link"
+          },
+          {
+            "from": "/terms",
+            "kind": "nav-link"
+          }
+        ],
+        "orphan": false,
+        "lastModified": "2026-05-03",
+        "hits7d": "unknown",
+        "status": "live",
+        "featureFlag": null
+      },
+      {
+        "path": "/privacy",
+        "method": [
+          "GET"
+        ],
+        "component": "src/app/privacy/page.tsx:default",
+        "title": "Privacy — MsgSchool",
+        "description": "Public privacy policy. Legal-style document; defers to /security for full architecture.",
+        "kind": "page",
+        "auth": "public",
+        "incomingLinks": [
+          {
+            "from": "/",
+            "kind": "nav-link"
+          },
+          {
+            "from": "/",
+            "kind": "footer-link"
+          },
+          {
+            "from": "/security",
+            "kind": "nav-link"
+          },
+          {
+            "from": "/terms",
+            "kind": "nav-link"
+          },
+          {
+            "from": "/terms",
+            "kind": "footer-link"
+          }
+        ],
+        "orphan": false,
+        "lastModified": "2026-05-03",
+        "hits7d": "unknown",
+        "status": "live",
+        "featureFlag": null
+      },
+      {
+        "path": "/terms",
+        "method": [
+          "GET"
+        ],
+        "component": "src/app/terms/page.tsx:default",
+        "title": "Terms — MsgSchool",
+        "description": "Public terms of service.",
+        "kind": "page",
+        "auth": "public",
+        "incomingLinks": [
+          {
+            "from": "/",
+            "kind": "nav-link"
+          },
+          {
+            "from": "/",
+            "kind": "footer-link"
+          },
+          {
+            "from": "/privacy",
+            "kind": "nav-link"
+          },
+          {
+            "from": "/privacy",
+            "kind": "footer-link"
+          },
+          {
+            "from": "/security",
+            "kind": "nav-link"
+          }
+        ],
+        "orphan": false,
+        "lastModified": "2026-04-21",
+        "hits7d": "unknown",
+        "status": "live",
+        "featureFlag": null
+      },
+      {
+        "path": "/api/bot/webhook",
+        "method": [
+          "POST"
+        ],
+        "component": "src/app/api/bot/webhook/route.ts:POST",
+        "title": null,
+        "description": "Telegram webhook ingress. Validates x-telegram-bot-api-secret-token header against TELEGRAM_WEBHOOK_SECRET env. Runs inbound credential scrubber on every message body BEFORE logging or dispatching. The single non-public-page endpoint of the application.",
+        "kind": "webhook",
+        "auth": "webhook-signature",
+        "incomingLinks": [
+          {
+            "from": "telegram-api",
+            "kind": "external-webhook"
+          }
+        ],
+        "orphan": false,
+        "formFields": [],
+        "submitEndpoint": null,
+        "lastModified": "2026-05-03",
+        "hits7d": "244 since 2026-04-19 (count of ms_messages rows of any direction)",
+        "status": "live",
+        "featureFlag": null
+      }
+    ],
+    "orphans": [],
+    "publicRoutes": [
+      "/",
+      "/privacy",
+      "/security",
+      "/terms"
+    ],
+    "adminRoutes": [],
+    "_notes": "No /admin route exists yet. ADMIN_PANEL_SPEC.md is a draft spec; no code has been written against it. /admin would be operator-internal and password-gated."
+  },
+  "datastores": [
+    {
+      "id": "postgresql",
+      "name": "msgschool postgres",
+      "engine": "postgres",
+      "engineVersion": "16.13",
+      "host": "127.0.0.1",
+      "port": 5432,
+      "runsOn": "msgschool-vm",
+      "sharedInstance": true,
+      "_sharedInstanceNote": "The 'msgschool' database co-resides with legacy OCMarketplace tables (accounts, agents, sessions, users, ...) on the same cluster. msgschool's tables are prefixed ms_* to avoid collision. When OCMarketplace is fully retired, a single rename migration will drop the prefix.",
+      "connectionShape": "postgres://<user>:<password>@127.0.0.1:5432/msgschool",
+      "sizeOnDiskGb": 0.0088,
+      "backupPolicy": "daily age-encrypted pg_dump → /var/backups/msgschool → rsync to <kvm-host>; 14-day local retention; offline private decryption key",
+      "backupLastRunAt": "2026-05-04T03:17:00Z (cron `17 3 * * *`)",
+      "usedBy": [
+        "msgschool",
+        "msgschool-toolsd"
+      ],
+      "schemas": [
+        {
+          "name": "public",
+          "purpose": "default; holds both ms_* (msgschool) and legacy OCMarketplace tables",
+          "ownerRole": "msgschool",
+          "tables": [
+            {
+              "name": "ms_users",
+              "purpose": "one row per Telegram account that has ever messaged the bot. Identity is the numeric Telegram user_id (stable, unforgeable). State machine column drives the bot's reply.",
+              "columns": [
+                {
+                  "name": "id",
+                  "type": "integer",
+                  "nullable": false,
+                  "default": "generated always as identity",
+                  "fk": null
+                },
+                {
+                  "name": "telegram_user_id",
+                  "type": "bigint",
+                  "nullable": false,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "telegram_username",
+                  "type": "text",
+                  "nullable": true,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "telegram_first_name",
+                  "type": "text",
+                  "nullable": true,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "state",
+                  "type": "text",
+                  "nullable": false,
+                  "default": "'new'",
+                  "fk": null
+                },
+                {
+                  "name": "free_uses_remaining",
+                  "type": "integer",
+                  "nullable": false,
+                  "default": "3",
+                  "fk": null
+                },
+                {
+                  "name": "workspace_path",
+                  "type": "text",
+                  "nullable": true,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "activated_at",
+                  "type": "timestamp",
+                  "nullable": true,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "expires_at",
+                  "type": "timestamp",
+                  "nullable": true,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "pending_delete_at",
+                  "type": "timestamp",
+                  "nullable": true,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "first_seen_at",
+                  "type": "timestamp",
+                  "nullable": false,
+                  "default": "now()",
+                  "fk": null
+                },
+                {
+                  "name": "updated_at",
+                  "type": "timestamp",
+                  "nullable": false,
+                  "default": "now()",
+                  "fk": null
+                }
+              ],
+              "primaryKey": [
+                "id"
+              ],
+              "foreignKeys": [],
+              "indexes": [
+                "ms_users_pkey",
+                "ms_users_telegram_user_id_unique"
+              ],
+              "rowCountApprox": 4,
+              "sizeMb": 0.05,
+              "writtenTo": [
+                "msgschool"
+              ],
+              "readFrom": [
+                "msgschool"
+              ],
+              "hasPii": false,
+              "_piiNote": "Per /privacy posture, telegram_user_id is treated as not-PII (opaque integer not derivable from a phone/email/name and not searchable on Telegram's surface). telegram_username and telegram_first_name are mutable display fields not used for auth and never rendered in operator analytics."
+            },
+            {
+              "name": "ms_messages",
+              "purpose": "inbound + outbound platform audit trail. Used for debug, abuse review, and the rate limiter. Not used for conversation context — the agent keeps its own memory in the workspace.",
+              "columns": [
+                {
+                  "name": "id",
+                  "type": "integer",
+                  "nullable": false,
+                  "default": "generated always as identity",
+                  "fk": null
+                },
+                {
+                  "name": "user_id",
+                  "type": "integer",
+                  "nullable": true,
+                  "default": null,
+                  "fk": "ms_users.id"
+                },
+                {
+                  "name": "telegram_user_id",
+                  "type": "bigint",
+                  "nullable": false,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "direction",
+                  "type": "text",
+                  "nullable": false,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "text",
+                  "type": "text",
+                  "nullable": false,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "meta",
+                  "type": "text",
+                  "nullable": true,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "created_at",
+                  "type": "timestamp",
+                  "nullable": false,
+                  "default": "now()",
+                  "fk": null
+                }
+              ],
+              "primaryKey": [
+                "id"
+              ],
+              "foreignKeys": [
+                {
+                  "columns": [
+                    "user_id"
+                  ],
+                  "references": "ms_users.id"
+                }
+              ],
+              "indexes": [
+                "ms_messages_pkey"
+              ],
+              "rowCountApprox": 244,
+              "sizeMb": 0.08,
+              "writtenTo": [
+                "msgschool"
+              ],
+              "readFrom": [
+                "msgschool"
+              ],
+              "hasPii": false,
+              "_piiNote": "On detected credential pastes, the row's text column stores `[scrubbed: <field>]` not the raw value. Outbound rows store opaque markers like `<agent reply>`; the literal reply text is not persisted."
+            },
+            {
+              "name": "ms_code_redemptions",
+              "purpose": "audit log of unlock-code uses",
+              "columns": [
+                {
+                  "name": "id",
+                  "type": "integer",
+                  "nullable": false,
+                  "default": "generated always as identity",
+                  "fk": null
+                },
+                {
+                  "name": "user_id",
+                  "type": "integer",
+                  "nullable": false,
+                  "default": null,
+                  "fk": "ms_users.id"
+                },
+                {
+                  "name": "code",
+                  "type": "text",
+                  "nullable": false,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "period_days",
+                  "type": "integer",
+                  "nullable": false,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "redeemed_at",
+                  "type": "timestamp",
+                  "nullable": false,
+                  "default": "now()",
+                  "fk": null
+                }
+              ],
+              "primaryKey": [
+                "id"
+              ],
+              "foreignKeys": [
+                {
+                  "columns": [
+                    "user_id"
+                  ],
+                  "references": "ms_users.id"
+                }
+              ],
+              "indexes": [
+                "ms_code_redemptions_pkey"
+              ],
+              "rowCountApprox": 3,
+              "sizeMb": 0.03,
+              "writtenTo": [
+                "msgschool"
+              ],
+              "readFrom": [
+                "msgschool"
+              ],
+              "hasPii": false
+            },
+            {
+              "name": "ms_tool_calls",
+              "purpose": "audit log for every msgschool-toolsd RPC. Records metadata only (no credential value, no response body).",
+              "columns": [
+                {
+                  "name": "id",
+                  "type": "integer",
+                  "nullable": false,
+                  "default": "generated always as identity",
+                  "fk": null
+                },
+                {
+                  "name": "telegram_user_id",
+                  "type": "bigint",
+                  "nullable": false,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "tool",
+                  "type": "text",
+                  "nullable": false,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "args_summary",
+                  "type": "text",
+                  "nullable": true,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "result_size_bytes",
+                  "type": "integer",
+                  "nullable": true,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "cache_hit",
+                  "type": "integer",
+                  "nullable": false,
+                  "default": "0",
+                  "fk": null
+                },
+                {
+                  "name": "latency_ms",
+                  "type": "integer",
+                  "nullable": true,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "error_code",
+                  "type": "text",
+                  "nullable": true,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "created_at",
+                  "type": "timestamp",
+                  "nullable": false,
+                  "default": "now()",
+                  "fk": null
+                }
+              ],
+              "primaryKey": [
+                "id"
+              ],
+              "foreignKeys": [],
+              "indexes": [
+                "ms_tool_calls_pkey",
+                "ms_tool_calls_tg_idx",
+                "ms_tool_calls_created_idx"
+              ],
+              "rowCountApprox": 17,
+              "sizeMb": 0.06,
+              "writtenTo": [
+                "msgschool-toolsd"
+              ],
+              "readFrom": [
+                "msgschool-toolsd"
+              ],
+              "hasPii": false
+            },
+            {
+              "name": "ms_drizzle_migrations",
+              "purpose": "drizzle-kit migration history specific to msgschool (avoids collision with the legacy 'drizzle_migrations' table)",
+              "columns": [
+                {
+                  "name": "id",
+                  "type": "integer",
+                  "nullable": false,
+                  "default": "generated always as identity",
+                  "fk": null
+                },
+                {
+                  "name": "hash",
+                  "type": "text",
+                  "nullable": false,
+                  "default": null,
+                  "fk": null
+                },
+                {
+                  "name": "created_at",
+                  "type": "bigint",
+                  "nullable": true,
+                  "default": null,
+                  "fk": null
+                }
+              ],
+              "primaryKey": [
+                "id"
+              ],
+              "foreignKeys": [],
+              "indexes": [
+                "ms_drizzle_migrations_pkey"
+              ],
+              "rowCountApprox": 2,
+              "sizeMb": 0.03,
+              "writtenTo": [
+                "drizzle-kit"
+              ],
+              "readFrom": [
+                "drizzle-kit"
+              ],
+              "hasPii": false
+            }
+          ]
+        }
+      ],
+      "roles": [
+        {
+          "name": "msgschool",
+          "usedBy": "msgschool, msgschool-toolsd",
+          "grants": [
+            "owner of all ms_* tables and sequences (ms_users, ms_messages, ms_code_redemptions, ms_tool_calls, ms_drizzle_migrations)"
+          ],
+          "canLogin": true,
+          "superuser": false
+        },
+        {
+          "name": "postgres",
+          "usedBy": "operator + drizzle-kit migrations",
+          "grants": [
+            "superuser"
+          ],
+          "canLogin": true,
+          "superuser": true
+        }
+      ],
+      "extensions": [
+        "plpgsql"
+      ],
+      "migrationsApplied": 2,
+      "migrationsPending": 0,
+      "_migrationsPendingSource": "git ls drizzle/*.sql vs SELECT count(*) FROM ms_drizzle_migrations: 2 == 2",
+      "replicationTopology": null
+    }
+  ],
+  "details": {
+    "disk": {
+      "projectRoot": "/var/www/msgschool",
+      "projectRootSizeMb": 671,
+      "topLevelDirs": [
+        {
+          "path": "node_modules/",
+          "purpose": "npm install output (Next.js 16 + drizzle + grammy + pg + playwright-core)",
+          "sizeMb": 660,
+          "fileCount": "unknown — large",
+          "owner": "root",
+          "mode": "0755",
+          "isGenerated": true,
+          "backedUp": false
+        },
+        {
+          "path": ".next/",
+          "purpose": "Next.js production build output",
+          "sizeMb": 7.9,
+          "fileCount": "unknown",
+          "owner": "root",
+          "mode": "0755",
+          "isGenerated": true,
+          "backedUp": false
+        },
+        {
+          "path": "src/",
+          "purpose": "application source — bot handler, toolsd, schema",
+          "sizeMb": 0.33,
+          "fileCount": "unknown",
+          "owner": "root",
+          "mode": "0755",
+          "isGenerated": false,
+          "backedUp": true
+        },
+        {
+          "path": "templates/",
+          "purpose": "agent workspace templates (PERSONA.md, AGENTS.md, CANVAS_PLAYBOOK.md, ...)",
+          "sizeMb": 0.28,
+          "fileCount": "unknown",
+          "owner": "root",
+          "mode": "0755",
+          "isGenerated": false,
+          "backedUp": true
+        },
+        {
+          "path": "docs/",
+          "purpose": "design + ops + spec docs (architecture, security, toolsd spec, admin panel spec, ...)",
+          "sizeMb": 0.18,
+          "fileCount": "unknown",
+          "owner": "root",
+          "mode": "0755",
+          "isGenerated": false,
+          "backedUp": true
+        },
+        {
+          "path": "scripts/",
+          "purpose": "provision/deprovision/install scripts + the credscan timer body",
+          "sizeMb": 0.09,
+          "fileCount": "unknown",
+          "owner": "root",
+          "mode": "0755",
+          "isGenerated": false,
+          "backedUp": true
+        },
+        {
+          "path": "drizzle/",
+          "purpose": "drizzle-kit migration files + meta",
+          "sizeMb": 0.04,
+          "fileCount": "unknown",
+          "owner": "root",
+          "mode": "0755",
+          "isGenerated": true,
+          "backedUp": true
+        },
+        {
+          "path": "bin/",
+          "purpose": "ms_call client wrapper (installed to /usr/local/bin/ms_call by install-toolsd.sh)",
+          "sizeMb": 0.008,
+          "fileCount": 1,
+          "owner": "root",
+          "mode": "0755",
+          "isGenerated": false,
+          "backedUp": true
+        }
+      ],
+      "dataRoots": [
+        {
+          "path": "/opt/msgschool/users/",
+          "purpose": "per-user agent workspaces — one canvasagent-<tg_id>/ subtree per Telegram user. Mode 0700 on the workspace root.",
+          "sizeMb": 17,
+          "fileCount": "unknown",
+          "kind": "uploads"
+        },
+        {
+          "path": "/var/backups/msgschool/",
+          "purpose": "daily age-encrypted backups (db dump + workspaces tarball + config tarball)",
+          "sizeMb": 249,
+          "fileCount": 42,
+          "kind": "build-artifacts"
+        },
+        {
+          "path": "/var/lib/postgresql/16/main/",
+          "purpose": "postgres data directory",
+          "sizeMb": "unknown — included in postgres engine accounting; total db is 9 MB",
+          "fileCount": "unknown",
+          "kind": "db-volume"
+        },
+        {
+          "path": "/run/msgschool/",
+          "purpose": "tmpfs-backed plaintext credential cache + the toolsd unix socket. Wiped on reboot; rehydrated by ensureAllUsersHydrated() on toolsd start.",
+          "sizeMb": 0,
+          "fileCount": "≤2 per provisioned user (canvas.json + skyward.json) + 1 socket",
+          "kind": "secrets"
+        },
+        {
+          "path": "/etc/msgschool/",
+          "purpose": "platform .env (Telegram token, DATABASE_URL, webhook secret). Mode 0640 root:readystack — flagged in security audit M4 to be tightened to 0600 root:root.",
+          "sizeMb": 0.001,
+          "fileCount": 1,
+          "kind": "secrets"
+        },
+        {
+          "path": "/root/.openclaw/",
+          "purpose": "OpenClaw agent config + sessions + bundled chromium user-data",
+          "sizeMb": "unknown — variable, includes session jsonls",
+          "fileCount": "unknown",
+          "kind": "logs"
+        }
+      ],
+      "uploadsTotalMb": 17,
+      "uploadsFileCount": "unknown — three workspaces, each with platform-symlinked + agent-writable files",
+      "uploadsOldestFile": "2026-04-19 (canvasagent-679381326 provisioning)",
+      "logsTotalMb": "unknown — journalctl-managed, capped by systemd config",
+      "buildArtifactsMb": 249,
+      "projectTotalOnHostMb": 938
+    },
+    "ci": null,
+    "_ciNote": "No CI pipeline. No GitHub Actions, no Vercel build. Deploy is manual via scripts/install-toolsd.sh on the prod VM. Flagged in security audit as a gap.",
+    "tests": {
+      "_summary": "46 unit tests across 15 suites in 2 test files. No integration tests, no e2e, no UI tests.",
+      "byFramework": [
+        {
+          "framework": "node:test (--experimental-strip-types)",
+          "command": "npm test (= node --test --experimental-strip-types 'src/**/*.test.ts')",
+          "tests": 46,
+          "suites": 15,
+          "files": 2,
+          "lastRunObservedPassing": true,
+          "lastRunAt": "2026-05-03"
+        }
+      ],
+      "_files": [
+        "src/lib/agent/envelope.test.ts",
+        "src/lib/agent/validator.test.ts"
+      ]
+    },
+    "security": {
+      "publicEndpoints": [
+        "https://msgschool.com/",
+        "https://msgschool.com/privacy",
+        "https://msgschool.com/security",
+        "https://msgschool.com/terms",
+        "https://msgschool.com/api/bot/webhook"
+      ],
+      "unauthenticatedEndpoints": [
+        "/",
+        "/privacy",
+        "/security",
+        "/terms"
+      ],
+      "_unauthenticatedNote": "These four are read-only marketing/legal/security pages; intended public. The webhook endpoint is publicly reachable but rejects requests without the x-telegram-bot-api-secret-token header matching TELEGRAM_WEBHOOK_SECRET.",
+      "adminEndpoints": [],
+      "_adminNote": "No /admin route exists yet. Spec at docs/ADMIN_PANEL_SPEC.md proposes /admin behind ADMIN_PASSWORD cookie + middleware; not built.",
+      "tlsVersion": "managed by Cloudflare edge — TLS 1.3 default",
+      "hstsEnabled": "unknown — Cloudflare-controlled, not in our nginx",
+      "hstsMaxAge": null,
+      "cspPolicy": null,
+      "_cspNote": "Not yet set on the Next.js side. Cloudflare may add edge-level headers but not verified.",
+      "sriEnabled": false,
+      "cookies": [],
+      "_cookiesNote": "No app-side cookies. The bot has no logged-in web session; auth is via Telegram identity routed through the webhook secret.",
+      "authProviders": [
+        "telegram (implicit, via webhook secret)"
+      ],
+      "mfaRequired": false,
+      "sessionStore": "n/a — stateless webhook",
+      "rateLimits": [
+        {
+          "endpoint": "/api/bot/webhook (per-Telegram-user-id)",
+          "policy": "DAILY_MSG_LIMIT=15/24h, MONTHLY_MSG_LIMIT=60/30d (env-overridable)"
+        },
+        {
+          "endpoint": "msgschool-toolsd unix socket (per tg)",
+          "policy": "documented in TOOLSD_SPEC.md §7.4 (30/min steady, burst 60)"
+        }
+      ],
+      "webhookSignatureVerification": [
+        {
+          "endpoint": "/api/bot/webhook",
+          "verified": true,
+          "_source": "src/app/api/bot/webhook/route.ts:19-21 reads x-telegram-bot-api-secret-token and compares to TELEGRAM_WEBHOOK_SECRET"
+        }
+      ],
+      "secretsLocation": "/etc/msgschool/.env mode 0600 root:root",
+      "secretsManager": "filesystem",
+      "openCves": [
+        {
+          "package": "esbuild",
+          "version": "transitive",
+          "cve": "GHSA-67mh-4wv8-2f99",
+          "severity": "moderate",
+          "_note": "Dev-server only; not exposed in production runtime"
+        },
+        {
+          "package": "postcss",
+          "version": "transitive",
+          "cve": "GHSA-qx2v-qp2m-jg93",
+          "severity": "moderate"
+        }
+      ],
+      "_openCvesSource": "npm audit --json on 2026-05-04 (post Next 16.2.4 bump) — total {moderate:6, high:0}. The Next.js high (GHSA-ggv3-7p47-pfv8 HTTP request smuggling) and the next/image cache CVE (GHSA-3x4c-7xq6-9pq8) closed by upgrading next 16.1.6 → 16.2.4 in commit ac92933.",
+      "dependabotOpen": "n/a — Dependabot not configured",
+      "exceptions": [
+        {
+          "id": "deferred-per-uid-isolation",
+          "what": "Agent process and msgschool-toolsd run as the same Linux UID (root). The agent could in principle `cat /run/msgschool/<agent>/canvas.json` and read plaintext.",
+          "why": "OpenClaw does not yet expose a per-agent setuid hook to launch the agent under a non-root UID. The defense today is behavioral (playbook hard-rules forbid reading the credential file or launching playwright + outbound scrubber + credscan timer) plus the structural fact that the agent has no playbook path that requires the credential value.",
+          "introducedAt": "2026-05-01",
+          "expiresAt": null,
+          "owner": "operator (waits on OpenClaw upstream)"
+        },
+        {
+          "id": "no-offhost-backup-destination",
+          "what": "Backup tarballs only land on the msgschool VM and on the KVM host. No third destination off-LAN.",
+          "why": "Adds a Spaces/B2/S3 dependency we haven't wired. Tarballs are age-encrypted with the private key held offline, so the leak risk is mitigated; the loss-risk (both VM and the KVM host dying together) is open.",
+          "introducedAt": "2026-04-21",
+          "expiresAt": null,
+          "owner": "operator"
+        },
+        {
+          "id": "apparmor-attach-incomplete",
+          "what": "AppArmor profiles for msgschool + msgschool-toolsd are authored, deployed, and loaded in complain mode at the kernel level, but the runtime processes are not being attached to them. systemd's AppArmorProfile= directive failed with 'no such file or directory' when wired in (rolled back); path-based attach via /usr/bin/npx isn't auto-binding to the systemd-launched npx process either.",
+          "why": "Path-vs-name attach mechanism on Ubuntu 24.04 with systemd needs more iteration — likely switching the profile target to /usr/bin/node with stricter exec stack, or using aa-exec wrapping in ExecStart. Profiles are loaded so the structural surface is ready; runtime attach is the remaining piece. Defense-in-depth value of the file-level deployment is partial: file permissions and the kernel's path-based denials (deny /etc/shadow etc.) won't fire until processes are matched.",
+          "introducedAt": "2026-05-04",
+          "expiresAt": null,
+          "owner": "operator"
+        },
+        {
+          "id": "chromium-no-sandbox",
+          "what": "Headless Chromium spawned by openclaw-gateway and by msgschool-toolsd Skyward sessions runs with --no-sandbox.",
+          "why": "Sandbox under non-root needs unprivileged user namespaces and chromium-bundled support; running as root with sandbox is also blocked. Today the only navigated origins are *.instructure.com and student.<district>.org — both trusted.",
+          "introducedAt": "2026-04-19",
+          "expiresAt": null,
+          "owner": "operator"
+        }
+      ],
+      "dataResidency": "United States — single VM behind Cloudflare US edge",
+      "piiLocations": [],
+      "_piiLocationsNote": "Per /privacy posture, telegram_user_id is treated as not-PII. Raw message text is never persisted (scrubbed labels only). No name/email/phone/address is collected. No piiLocations claimed.",
+      "encryptionAtRest": [
+        {
+          "datastore": "postgresql",
+          "method": "provider-default (LUKS/dm-crypt at the host VM disk layer is operator's choice; not enforced by app)"
+        },
+        {
+          "datastore": "credentials/*.json.enc on workspace disk",
+          "method": "systemd-creds (machine-bound key held by the host kernel)"
+        },
+        {
+          "datastore": "/var/backups/msgschool/*.age",
+          "method": "age (recipient pubkey on host; private key held offline)"
+        }
+      ],
+      "incidentLog": [
+        {
+          "date": "2026-05-01",
+          "summary": "ensureAllUsersHydrated() defined but never called — 11-day silent breakage of Tona's account post-reboot. Wired into msgschool-toolsd startup; verified all users back online.",
+          "rcaLink": null
+        },
+        {
+          "date": "2026-04-30",
+          "summary": "Inbound credential scrubber half-fired on 'unclassified' detections: DB row redacted but Telegram message left in chat AND forwarded to agent in plaintext. Fixed by branching on detection.hasAnyCredential rather than fields.length.",
+          "rcaLink": null
+        },
+        {
+          "date": "2026-04-30",
+          "summary": "Agent observed echoing real credentials to Telegram chat. Triggered design + cutover of msgschool-toolsd + outbound scrubber + credscan timer + playbook hard rules forbidding reading the credential file or writing playwright scripts.",
+          "rcaLink": null
+        }
+      ],
+      "lastPentestAt": null,
+      "threatModel": "Single-tenant home-VM Telegram agent with per-user credentials for school portals (Canvas, Skyward). Highest-impact threat is leakage of a parent's Skyward password (account-takeover surface for the family's school account: address, emergency contacts, possibly schedule changes). Defense layers: (1) inbound scrubber deletes credential pastes from chat + redacts in DB; (2) playbook rules forbid the agent from reading credential files, writing scripts that contain credentials, calling Canvas/Skyward directly, or echoing credentials in chat; (3) outbound scrubber strips literal credential bytes from every reply; (4) credscan timer sweeps every workspace every 2 minutes for plaintext credential occurrences. Out of scope: VM-root compromise, Telegram-account takeover, Telegram-side retention of deleted messages. See https://msgschool.com/security for the user-facing version."
+    },
+    "observability": {
+      "metrics": "none — no Prometheus / Grafana / Datadog. journalctl is the only telemetry.",
+      "logs": [
+        {
+          "stream": "msgschool",
+          "command": "journalctl -u msgschool"
+        },
+        {
+          "stream": "msgschool-toolsd",
+          "command": "journalctl -u msgschool-toolsd"
+        },
+        {
+          "stream": "openclaw-gateway",
+          "command": "sudo XDG_RUNTIME_DIR=/run/user/0 journalctl --user -u openclaw-gateway"
+        },
+        {
+          "stream": "credscan",
+          "command": "journalctl -t credscan"
+        },
+        {
+          "stream": "cloudflared",
+          "command": "journalctl -u cloudflared"
+        },
+        {
+          "stream": "postgres",
+          "command": "journalctl -u postgresql@16-main"
+        }
+      ],
+      "tracing": null,
+      "alerting": null,
+      "_alertingNote": "No paging. The healthcheck endpoint planned in the admin-panel spec is the closest scheduled replacement."
+    },
+    "history": {
+      "_squashNote": "Git history was squashed to a single commit on 2026-05-03 immediately before the repo was flipped public. Pre-squash development was 107 commits in private; post-squash there is one commit and no archaeology.",
+      "commits90d": 1,
+      "lastTaggedRelease": null,
+      "docTodos": [
+        "ADMIN_PANEL_SPEC.md is a draft; no code written yet",
+        "TOOLSD_SPEC.md §1 lists per-UID isolation as deferred — still open",
+        "PRIVACY_DEFENSIBILITY_WORKPLAN.md predates toolsd cutover; some items now done (encryption-at-rest), others still open (off-host backups, /delete fully wired)",
+        "OPS.md SSH alias `msgschool` referenced but not in this user's ssh config; deploy guide assumes operator added it manually"
+      ]
+    },
+    "dns": {
+      "msgschool.com": {
+        "managedBy": "Cloudflare",
+        "ingress": "Cloudflare Tunnel (no inbound A/AAAA pointing at the VM)",
+        "tlsAt": "Cloudflare edge",
+        "telegramWebhookUrl": "https://msgschool.com/api/bot/webhook"
+      }
+    },
+    "llmModels": {
+      "_summary": "Every agent runs the same primary→fallback rotation. Current routing flipped to Moonshot Kimi K2.6 primary + K2.5 fallback on 2026-05-13 (replacing xAI Grok). Recorded in /root/.openclaw/openclaw.json; user-facing copy on msgschool.com is vendor-agnostic so swaps don't require site updates.",
+      "rotation": [
+        {
+          "role": "primary",
+          "id": "moonshot/kimi-k2.6",
+          "vendor": "Moonshot AI (Kimi platform, direct API)",
+          "context_window_k": 256,
+          "thinkingDefault": "off",
+          "purpose": "primary path for every agent turn; Instant Mode (thinking off) for deterministic Canvas/Skyward playbook execution + low Telegram-reply latency"
+        },
+        {
+          "role": "fallback",
+          "id": "moonshot/kimi-k2.5",
+          "vendor": "Moonshot AI (Kimi platform, direct API)",
+          "context_window_k": 1000,
+          "thinkingDefault": "off",
+          "purpose": "automatic fallback when K2.6 is degraded or returns 5xx; same provider, so won't survive a Moonshot-wide outage — Anthropic key is configured in models.providers.anthropic if a cross-provider safety net needs to be re-engaged"
+        }
+      ],
+      "appliedTo": [
+        "canvasagent-100000001 (operator)",
+        "canvasagent-100000002 (parent)",
+        "canvasagent-100000003 (test account)"
+      ],
+      "_appliedToNote": "Placeholder Telegram IDs match the repo-content scrub policy. Real IDs exist in /root/.openclaw/openclaw.json on the host.",
+      "switchTool": "direct jq edit + SIGUSR1 to gateway. The legacy scripts/switch-model.sh fleet flip is not in this repo's history; per-swap jq surgery is the current pattern.",
+      "thinkingDefaultRationale": "Forced 'off' for every agent on every model. Rationale was originally observed in Sonnet (2026-04-29 regression — thinking=high made the agent MORE speculative on this narrow task, overrode HARD RULES, offered fake features). Re-validated as the right default for Kimi K2.6 — Instant Mode matches our deterministic playbook better than Thinking Mode (which doubles latency for no upside on structured pulls). See docs/LLM_BEHAVIOR_MITIGATIONS.md §6.",
+      "providerKeysLocation": "/root/.openclaw/openclaw.json (mode 0600 root:root) under models.providers.<provider>.apiKey. Today the active key is models.providers.moonshot.apiKey; dormant blocks for anthropic / xai / openai / openrouter keys remain in the file for fast re-engagement."
+    },
+    "externalDeps": [
+      {
+        "id": "telegram-api",
+        "kind": "messaging",
+        "purpose": "the entire user-facing surface; bot pairs via @MsgSchoolBot",
+        "credentials": "TELEGRAM_BOT_TOKEN env"
+      },
+      {
+        "id": "moonshot-api",
+        "kind": "llm",
+        "purpose": "primary + fallback for every agent turn (Kimi K2.6 → K2.5). When the active provider changes, regenerate this entry along with components.openclaw-gateway.description and llmModels.rotation.",
+        "credentials": "Moonshot key in /root/.openclaw/openclaw.json (models.providers.moonshot.apiKey)"
+      },
+      {
+        "id": "canvas-api",
+        "kind": "school-data",
+        "purpose": "REST API for assignments/grades/courses; per-user PAT",
+        "credentials": "per-user, encrypted at rest in canvas.json.enc"
+      },
+      {
+        "id": "skyward-portal",
+        "kind": "school-data",
+        "purpose": "Family Access portal for grades/attendance/discipline; scraped via headless Chromium",
+        "credentials": "per-user username+password, encrypted at rest in skyward.json.enc"
+      },
+      {
+        "id": "cloudflare-tunnel",
+        "kind": "ingress",
+        "purpose": "outbound-only tunnel that exposes msgschool.com",
+        "credentials": "/etc/cloudflared/<tunnel-id>.json"
+      }
+    ]
+  },
+  "selfCheck": {
+    "spec_is_current": "passed",
+    "specUrl_points_to_manual": "passed",
+    "generatedAt_in_session": "passed",
+    "every_component_has_status_and_statusSource": "passed",
+    "every_component_description_explains_purpose_and_failure_mode": "passed",
+    "every_router_route_in_siteMap": "passed — 4 page routes + 1 webhook route, matches `find src/app -name 'route.ts' -o -name 'page.tsx'`",
+    "every_route_has_incomingLinks": "passed — empty arrays where genuinely no incoming references exist (the home page itself is entry-point)",
+    "siteMap_orphans_matches": "passed — orphans list is empty because every route has at least one incoming link or is the entry point",
+    "every_datastore_has_per_schema_row_counts_and_per_table_sizes": "passed",
+    "every_datastore_lists_roles_and_grants": "passed",
+    "disk_usage_for_project_root_and_external_data_roots": "passed",
+    "uploads_directory_size_and_count": "passed (workspace count = 3 users; finer per-file counting marked unknown with reason)",
+    "ci_last_run_status_or_null_with_reason": "passed — null with reason 'no CI configured'",
+    "tests_counts_by_framework": "passed",
+    "security_unauthenticatedEndpoints_explicitly_enumerated": "passed",
+    "security_exceptions_present": "passed — 6 exceptions enumerated with id/what/why/owner",
+    "history_docTodos_lists_contradictions": "passed",
+    "business_block_present_only_if_opted_in": "passed — omitted (not opted in)",
+    "no_secrets_or_connection_string_bodies": "passed — env names only, connection-shape uses placeholder, age recipient/private not echoed",
+    "ascii_preview_120_columns": "n/a — operator deferred ASCII preview to viewer-side rendering; this manifest is JSON-only",
+    "selfCheck_present_with_passes_or_n/a": "passed"
+  }
+}

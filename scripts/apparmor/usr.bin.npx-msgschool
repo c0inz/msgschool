@@ -1,0 +1,122 @@
+#include <tunables/global>
+
+# AppArmor profile for the msgschool Next.js bot (msgschool.service).
+#
+# Started in COMPLAIN mode to log violations without blocking. Promote
+# to enforce after a week of clean logs:
+#     sudo aa-enforce /etc/apparmor.d/usr.bin.npx-msgschool
+#
+# What this profile pins:
+#   - Working dir: /var/www/msgschool/
+#   - Env file:    /etc/msgschool/.env (read)
+#   - Workspaces:  /opt/msgschool/users/ (read+write — per-user dirs)
+#   - Socket:      /run/msgschool/toolsd.sock (rw — talks to toolsd)
+#   - Network:     outbound TCP to api.telegram.org via Cloudflare tunnel
+#                  (we observe the outbound through cloudflared, but the
+#                  bot itself initiates outbound when sending Telegram
+#                  messages back; that goes 0.0.0.0/0:443 since we don't
+#                  pre-resolve)
+#
+# What this denies (in enforce):
+#   - Reading /etc/shadow, /root/, other users' dotfiles
+#   - Writing outside the project tree, /opt/msgschool/, /tmp/
+#   - exec of arbitrary system tools beyond what we need
+
+# Match the systemd ExecStart: /usr/bin/npx next start ...
+profile msgschool /usr/bin/npx flags=(complain) {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+  #include <abstractions/openssl>
+  #include <abstractions/ssl_certs>
+
+  # Node + npm runtime
+  /usr/bin/npx                              ix,
+  /usr/bin/node                             ix,
+  /usr/bin/sh                               ix,
+  /usr/bin/bash                             ix,
+  /usr/bin/dash                             ix,
+  /usr/bin/sudo                             ix,  # provision/deprovision shell-out
+
+  # Project tree (read; .next/build write during build but bot is start-only)
+  /var/www/msgschool/                       r,
+  /var/www/msgschool/**                     r,
+  /var/www/msgschool/.next/cache/**         rw,
+  /var/www/msgschool/node_modules/**        r,
+
+  # Env file
+  /etc/msgschool/                           r,
+  /etc/msgschool/.env                       r,
+
+  # Per-user workspaces (read+write — bot writes USER.md updates etc.)
+  /opt/msgschool/                           r,
+  /opt/msgschool/users/                     rw,
+  /opt/msgschool/users/**                   rw,
+
+  # Tmpfs credential socket + cred files (read for outbound scrubber lookup)
+  /run/msgschool/                           r,
+  /run/msgschool/toolsd.sock                rw,
+  /run/msgschool/canvasagent-*/             r,
+  /run/msgschool/canvasagent-*/*.json       r,
+
+  # Provision / deprovision scripts
+  /var/www/msgschool/scripts/               r,
+  /var/www/msgschool/scripts/*.sh           rix,
+
+  # Standard system reads
+  /etc/passwd                               r,
+  /etc/group                                r,
+  /etc/hosts                                r,
+  /etc/resolv.conf                          r,
+  /etc/ssl/                                 r,
+  /etc/ssl/**                               r,
+  /usr/lib/                                 r,
+  /usr/lib/**                               r,
+  /usr/share/                               r,
+  /usr/share/**                             r,
+  /proc/sys/kernel/random/uuid              r,
+  /proc/sys/kernel/random/boot_id           r,
+  /proc/cpuinfo                             r,
+  /proc/meminfo                             r,
+  /proc/loadavg                             r,
+  /proc/version                             r,
+  /proc/*/status                            r,
+  /sys/devices/system/cpu/                  r,
+  /sys/devices/system/cpu/online            r,
+
+  # Logs (journalctl forwards stdout/stderr; no file writes needed)
+  /tmp/                                     rw,
+  /tmp/**                                   rw,
+
+  # Network — TCP outbound (Telegram + Postgres loopback + ms_call socket)
+  network inet  stream,
+  network inet6 stream,
+  network unix  stream,
+
+  # No raw sockets, no privileged network ops
+  deny network raw,
+  deny network packet,
+
+  # Capability needs
+  capability dac_read_search,  # reading the env file across users
+  capability sys_resource,     # node may bump rlimits
+  deny capability sys_admin,
+  deny capability net_admin,
+  deny capability net_raw,
+  deny capability sys_module,
+
+  # No ptrace except self
+  ptrace (read,readby) peer=msgschool,
+  deny ptrace,
+
+  # Postgres loopback connections via /var/run/postgresql or 127.0.0.1
+  /var/run/postgresql/                      r,
+  /var/run/postgresql/.s.PGSQL.5432         rw,
+
+  # Reading /etc/shadow, /root/, other users — denied by absence
+  deny /etc/shadow                          r,
+  deny /etc/shadow.lock                     r,
+  deny /root/**                             r,
+  deny /home/**/.ssh/**                     r,
+  deny /home/**/.aws/**                     r,
+  deny /home/**/.config/**                  r,
+}

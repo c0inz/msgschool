@@ -1,0 +1,175 @@
+{
+  "_comment": "Reference artifact for the Skyward baseline probe. Parallel to CANVAS_PROBE_REFERENCE.json but Skyward has no public API, so the 'probe' is a Playwright-driven login + gradebook scrape. Structure derived from the working Canyons pattern verified in SKYWARD_PLAYBOOK.md. Agents use this to know (a) the exact Playwright sequence, (b) which DOM anchors prove success at each step, (c) what to capture into state/ready.json as Skyward baseline, (d) how to map real failures to user-facing messages instead of inventing 'the portal seems to be blocking us'.",
+
+  "probe_sequence": [
+    {
+      "step": 1,
+      "purpose": "Validate URL shape. Skyward portal URLs always contain 'wsisa.dll'. Without this the rest won't work.",
+      "action": "regex_check",
+      "pattern": "wsisa\\.dll",
+      "on_failure": "Refuse the URL as malformed. Reply: '⚠️ That doesn't look like a Skyward portal URL — they always contain `wsisa.dll`. Canyons example: `https://student.canyonsdistrict.org/scripts/wsisa.dll/WService=wsEAplus/fwemnu01.w`. Can you grab the URL from your Skyward bookmark?'",
+      "capture_into_ready_json": null
+    },
+    {
+      "step": 2,
+      "purpose": "Navigate to login page and confirm the login form is present.",
+      "action": "page.goto",
+      "browser_args": ["--no-sandbox"],
+      "headless": true,
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      "wait_until": "domcontentloaded",
+      "timeout_ms": 30000,
+      "_wait_note": "Do NOT use 'networkidle' here — Canyons Skyward (and likely others) keep a polling/keepalive connection open so networkidle never fires and page.goto times out. Use 'domcontentloaded' and then wait for #login to be visible as the real readiness signal.",
+      "post_goto_wait": "await page.locator('#login').waitFor({ state: 'visible', timeout: 15000 })",
+      "success_anchors": {
+        "login_field_selector": "#login",
+        "password_field_selector": "#password"
+      },
+      "on_failure_signatures": {
+        "network_tcp_timeout": "curl/browser receives TCP connect timeout, error code 28, or NS_ERROR_NET_TIMEOUT. This usually means the district is geo-fencing / IP-blocking the server's outbound IP, NOT that the portal is down. Verified 2026-04-20 on msgschool production droplet (DO SFO2 <droplet-ip> → student.canyonsdistrict.org <canyons-ip>): TCP blackholed. Canvas from the same box works fine. Report to the user: '⚠️ My server can't reach the Skyward portal from this network — sometimes school districts block non-local IPs. This is a platform-side issue, not your credentials.' Then escalate by writing a note under memory/ so the operator sees it.",
+        "selector_never_appears": "page.goto succeeds but #login never becomes visible within 15s — Skyward has been redesigned. Report: '⚠️ Skyward's login page looks different than expected — our automation needs an update. Let @johntdavenport know the district URL.'"
+      }
+    },
+    {
+      "step": 3,
+      "purpose": "Submit login via Skyward's JavaScript trigger (NOT form submit — that doesn't work) and capture the new page/popup.",
+      "action": "fill_and_trigger",
+      "fill": [
+        { "selector": "#login", "value_source": "credentials/skyward.json#username" },
+        { "selector": "#password", "value_source": "credentials/skyward.json#password" }
+      ],
+      "trigger_javascript": "if (cbs('bLogin')) { tryLogin(); }",
+      "wait_strategy": "context.waitForEvent('page', { timeout: 15000 }) wrapped in Promise.all with the trigger",
+      "success_anchors": {
+        "post_login_page_count": 2,
+        "popup_url_contains_any_of": ["fwemnu01", "famaccess", "wsEAplus"],
+        "popup_text_contains_any_of": ["Family Access", "Gradebook", "Home"]
+      },
+      "on_failure_signatures": {
+        "popup_never_opened": "Login trigger fired but no new page appeared within 15s. Usually means credentials were rejected (wrong username/password). Report: '⚠️ Skyward rejected those credentials. Double-check your username + password by logging in at the portal URL in your own browser first, then paste again.'",
+        "popup_shows_login_again": "The popup URL still points at the login form. Same root cause — bad creds. Same user-facing message.",
+        "security_code_field_visible": "If a 'Security Code' field appears, try the login anyway — it's often a hidden MFA stub that's not actually active. If the login still fails after retry, MFA is real: report: '⚠️ Skyward is asking for a security code — your account has MFA enabled, which we can't yet handle. Contact your district to disable MFA for this account or wait for a future msgschool update.'"
+      }
+    },
+    {
+      "step": 4,
+      "purpose": "Navigate to Gradebook on the NEW page (popup), not the original login page. Confirm gradebook loads.",
+      "action": "click_and_wait",
+      "click_target": "text=Gradebook",
+      "wait_strategy": "After click, await popup.locator('a[id=\"showGradeInfo\"]').first().waitFor({ timeout: 15000 }) — this is the real readiness signal, not a fixed sleep. Fixed page.waitForTimeout(10000) is a last-resort fallback only.",
+      "wait_strategy": "popup.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(()=>{}), then await Promise.race([locator('text=Gradebook').waitFor, locator('text=Family Access').waitFor, locator('text=Home').waitFor]) with 15s timeout each. Do NOT rely on networkidle here either.",
+      "success_anchors": {
+        "grade_links_selector": "a[id=\"showGradeInfo\"]",
+        "grade_links_min_count": 1
+      },
+      "on_failure": "If no grade links appear after 10s, the gradebook didn't render. Report: '⚠️ Skyward logged in but the gradebook didn't render — this sometimes happens when the portal is slow. Want me to retry?'"
+    },
+    {
+      "step": 5,
+      "purpose": "Extract baseline — course rows + current grades. This is the 'non-trivial' proof equivalent to Canvas's curriculum probe: the agent must successfully parse at least one course+grade pair to be considered ready.",
+      "action": "dom_extract",
+      "extraction_method": "position_anchored",
+      "extraction_code": "See SKYWARD_PLAYBOOK.md Method 2 (Row-Anchored Extraction). Extract all courses via body.innerText regex; extract all a[id='showGradeInfo'] links; match by position index. Capture: course name, period, teacher, grade letter, data-gid (course id), data-lit (term, e.g. 'Q4'), data-bkt (bucket, e.g. 'TERM 4').",
+      "success_criteria": "At least one matched {course, grade} pair where grade is a non-empty letter/percentage.",
+      "capture_into_ready_json": ["course_rows_visible (count)", "sample_course_name (first matched)", "current_term (from data-lit)"]
+    }
+  ],
+
+  "dom_landmarks": {
+    "_description": "Stable DOM anchors to look for at each stage. If any of these stop matching, Skyward has updated and the playbook needs a refresh — escalate rather than guess.",
+    "login_page": {
+      "username_input": "#login",
+      "password_input": "#password",
+      "submit_function_name": "tryLogin",
+      "submit_guard_function": "cbs(\"bLogin\")"
+    },
+    "post_login_popup": {
+      "body_text_contains": ["Family Access"],
+      "home_link": "text=Home",
+      "gradebook_link": "text=Gradebook"
+    },
+    "gradebook_page": {
+      "grade_link_selector": "a[id=\"showGradeInfo\"]",
+      "grade_link_attrs": {
+        "data-gid": "course id, usually 7 digits starting 880xxxx",
+        "data-lit": "term label, e.g. 'Q4' or 'S2'",
+        "data-bkt": "bucket label, e.g. 'TERM 4'"
+      },
+      "grade_link_text": "letter grade or percentage, e.g. 'A', 'B+', 'C', '92%'"
+    },
+    "grade_detail_dialog": {
+      "dialog_selector": "[role=\"dialog\"]",
+      "term_header_text_pattern": "Q\\d Progress Report",
+      "verify_before_parse": "Always confirm dialog shows the expected term before extracting; Skyward reuses modals across clicks."
+    }
+  },
+
+  "extraction_patterns": {
+    "missing_assignments": {
+      "location": "Separate section on the gradebook page, below the grade table.",
+      "extraction_regex": "has \\d+ missing assignments:([\\s\\S]*?)(?=Class Grades|$)",
+      "verified": true
+    },
+    "attendance": {
+      "_status": "UNVERIFIED — captured shape should be added by the first agent that successfully runs /attendance. Do NOT invent selectors. If the agent hits attendance extraction before this section is filled, it should explore the DOM (dump table structures, take screenshots) and report what it finds rather than pretending to return data.",
+      "probable_nav": "After login popup: click 'Attendance' link (same menu as Gradebook)",
+      "likely_row_shape": "Each absence row has: date, period/class, reason code (A=absent, T=tardy, E=excused, U=unexcused), teacher-entered comment",
+      "todo": "Run /attendance once with debug screenshots, capture selectors, update this section."
+    },
+    "class_schedule": {
+      "_status": "UNVERIFIED — likely accessible via 'Schedule' menu link. Same advisory as attendance above."
+    }
+  },
+
+  "baseline_ready_json_skyward_block": {
+    "_description": "The skyward sub-object the agent writes into state/ready.json. Must ALL be populated and truthy before the Skyward portion of the gate passes. Merges with the canvas block from CANVAS_PROBE_REFERENCE.json.",
+    "skyward": {
+      "url": "<stored portal URL>",
+      "probe_at": "<ISO-8601 UTC>",
+      "login_probe_ok": true,
+      "gradebook_reachable": true,
+      "course_rows_visible": 6,
+      "sample_course_name": "SECONDARY MATH 3",
+      "current_term": "Q4"
+    }
+  },
+
+  "failure_signatures": {
+    "_description": "Map real Playwright/Skyward errors to honest user-facing messages. The bad pattern to AVOID is the agent paraphrasing any failure as 'the portal seems to be blocking automated browser sessions' — Skyward does not bot-detect, and that phrase is almost always a hallucination on top of a real error the agent didn't capture.",
+    "page_goto_timeout_tcp_blackhole": {
+      "signal": "page.goto throws after the full timeout AND curl against the same URL from the server also times out with exit 28 (connection refused / timed out at TCP level). Verified this scenario on msgschool production 2026-04-20: Canyons (<canyons-ip>) is unreachable from DO SFO2.",
+      "meaning": "The server cannot establish TCP to the portal host. Almost always district-side IP filtering, NOT creds, NOT portal down (user can reach it from home).",
+      "user_message": "⚠️ My server can't reach the Skyward portal — school districts sometimes block non-local IPs. This is a platform issue, not your account. I've flagged it for @johntdavenport. In the meantime, Canvas data should still work — try `/grades` or `/assignments`.",
+      "agent_action": "Write a dated note to memory/YYYY-MM-DD.md with the URL and host IP so the operator sees it."
+    },
+    "page_goto_timeout_networkidle": {
+      "signal": "page.goto throws TimeoutError waiting for networkidle but the page is actually loaded (selectors exist if you check).",
+      "meaning": "You followed an outdated playbook that used waitUntil: 'networkidle'. The portal keeps connections open for polling.",
+      "fix": "Retry with waitUntil: 'domcontentloaded' + explicit page.locator('#login').waitFor().",
+      "user_message": "(internal — fix the code, don't surface this one to the user)"
+    },
+    "login_popup_never_opened": {
+      "signal": "context.waitForEvent('page') times out 15s after firing the login trigger, no new page appears",
+      "meaning": "Credentials rejected, OR the login JS didn't fire (portal page structure changed).",
+      "user_message": "⚠️ Skyward rejected those credentials. Can you log into the portal in your own browser with the same username/password to confirm they work? If they do and this still fails, the portal may have updated — let @johntdavenport know."
+    },
+    "gradebook_empty_after_click": {
+      "signal": "After clicking 'Gradebook', a[id='showGradeInfo'] locator returns 0 after 10s wait",
+      "meaning": "Gradebook loaded but no grades are posted yet (early in term) — OR the popup is on the wrong page.",
+      "user_message": "⚠️ I reached Skyward but no grades are showing — either we're between grading periods or the page structure has changed. Want me to retry, or can you confirm there should be current grades visible when you log in manually?"
+    },
+    "mfa_required": {
+      "signal": "A security-code field remains visible AND the popup never opens AND retry with credentials alone fails",
+      "user_message": "⚠️ Skyward is asking for a 2FA security code on this account — msgschool can't handle that yet. You'd need to turn off MFA in your Skyward account settings, or we'll add MFA support later."
+    },
+    "selectors_broken": {
+      "signal": "#login or #password input not found on the login page",
+      "meaning": "The Skyward portal has been redesigned and our selector landmarks are stale.",
+      "user_message": "⚠️ Skyward's portal looks different than expected — our automation needs an update. Let @johntdavenport know with the URL you're using so he can refresh the playbook."
+    },
+    "network_error": {
+      "signal": "DNS failure, connection refused, TLS error",
+      "user_message": "⚠️ Can't reach the Skyward portal. Is the URL right? Can you load it in your own browser?"
+    }
+  }
+}

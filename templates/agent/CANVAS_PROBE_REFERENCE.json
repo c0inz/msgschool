@@ -1,0 +1,156 @@
+{
+  "_comment": "Reference artifact for the Canvas baseline probe. Agents use this to know (a) which endpoints to hit on first connection, (b) what shape the responses have, (c) which fields to capture into state/ready.json. Real samples captured 2026-04-20 against canyons.instructure.com with a student PAT. Values redacted where necessary; shape is accurate.",
+
+  "probe_sequence": [
+    {
+      "step": 1,
+      "purpose": "Identity probe — cheapest possible check that the token works and the account is active.",
+      "method": "GET",
+      "path": "/api/v1/users/self",
+      "success_criteria": "HTTP 200 with a numeric `id` and non-empty `name`",
+      "capture_into_ready_json": ["id", "name", "sortable_name", "short_name"]
+    },
+    {
+      "step": 2,
+      "purpose": "Course list — proves the token has read access to the user's active enrollments.",
+      "method": "GET",
+      "path": "/api/v1/courses?enrollment_state=active&per_page=20",
+      "success_criteria": "HTTP 200 with a JSON array of 1+ courses",
+      "capture_into_ready_json": ["id", "name", "course_code", "start_at", "end_at"]
+    },
+    {
+      "step": 3,
+      "purpose": "Curriculum-level proof — picks one academic course (skip advisory/homeroom/civics-test/lunch), pulls modules with items. This is the 'non-trivial' proof: token can read actual curriculum, not just account metadata.",
+      "method": "GET",
+      "path": "/api/v1/courses/:course_id/modules?include[]=items&per_page=20",
+      "course_selection_rule": "Pick the first course whose `name` does NOT match /advisory|homeroom|civics.?test|lunch|study.?hall|office|zero.?hour/i. If all courses match, fall back to the first one.",
+      "success_criteria": "HTTP 200, array length >= 1, at least one module has `items_count > 0`",
+      "capture_into_ready_json": ["course_id", "module_count", "total_item_count"]
+    },
+    {
+      "step": 4,
+      "purpose": "Syllabus + teacher roster for the same course — supplemental curriculum context. Common that syllabus_body is empty; that's fine.",
+      "method": "GET",
+      "path": "/api/v1/courses/:course_id?include[]=syllabus_body&include[]=teachers",
+      "success_criteria": "HTTP 200 with `id` matching request",
+      "capture_into_ready_json": ["teachers[].display_name", "syllabus_has_content (boolean)"]
+    }
+  ],
+
+  "example_responses": {
+    "users_self": {
+      "id": 3886973,
+      "name": "REDACTED STUDENT",
+      "created_at": "2019-02-12T17:37:44Z",
+      "sortable_name": "LASTNAME, FIRSTNAME",
+      "short_name": "REDACTED STUDENT",
+      "first_name": "FIRSTNAME",
+      "last_name": "LASTNAME",
+      "locale": null,
+      "effective_locale": "en"
+    },
+    "courses_active": {
+      "_count": 8,
+      "_note": "Canyons pattern: course_code = 'SUBJECT LEVEL-TEACHERLASTNAME'. The embedded teacher name is load-bearing context — capture it.",
+      "_samples": [
+        { "id": 1907705, "name": "SECONDARY MATH 3 -KENNEDY", "course_code": "SECONDARY MATH 3 -KENNEDY", "start_at": "2025-08-13T06:00:00Z", "enrollment_term_id": 6520, "workflow_state": "available" },
+        { "id": 1905819, "name": "LANGUAGE ARTS 10-BRANNAN", "course_code": "LANGUAGE ARTS 10-BRANNAN" },
+        { "id": 1905724, "name": "SPANISH 2-GONZALEZ", "course_code": "SPANISH 2-GONZALEZ" },
+        { "id": 1906271, "name": "SPORTS PSYCHOLOGY-GUSTAFSON", "course_code": "SPORTS PSYCHOLOGY-GUSTAFSON" },
+        { "id": 1906840, "name": "STUDENT ADVISORY 10-KENNEDY", "course_code": "STUDENT ADVISORY 10-KENNEDY", "_skip_for_curriculum_probe": "matches /advisory/i" }
+      ]
+    },
+    "course_modules_with_items": {
+      "_count": 4,
+      "_samples": [
+        {
+          "id": 5473121,
+          "position": 2,
+          "name": "Unit 10: Equations, Applications and Graphs of Logarithms",
+          "state": "completed",
+          "completed_at": "2026-04-17T18:07:10Z",
+          "items_count": 10,
+          "items": [
+            { "id": 68573301, "position": 1, "title": "10.1 Log Parent Graphs", "type": "Assignment", "content_id": 24392160 },
+            { "id": 68573302, "position": 2, "title": "10.2 Graphing Log Shifts", "type": "Assignment", "content_id": 24392164 },
+            { "id": 68573314, "position": 9, "title": "Unit 10 Review (No Credit)", "type": "Assignment", "content_id": 24392369 },
+            { "id": 68573316, "position": 10, "title": "Unit 10 Retake Qualifier", "type": "Assignment", "content_id": 24392368 }
+          ]
+        }
+      ],
+      "_interpretation": "Items include Assignments, Quizzes, Pages, Files, ExternalUrls. 'state' on the module itself is per-user (locked/unlocked/started/completed). 'completed_at' is load-bearing for schedule-drift analysis."
+    },
+    "course_with_syllabus_and_teachers": {
+      "id": 1907705,
+      "name": "SECONDARY MATH 3 -KENNEDY",
+      "course_code": "SECONDARY MATH 3 -KENNEDY",
+      "syllabus_body": "",
+      "_syllabus_note": "Often empty in the wild. Do NOT treat empty syllabus as a probe failure.",
+      "teachers": [
+        { "id": 3055078, "display_name": "REDACTED TEACHER 1" },
+        { "id": 3649901, "display_name": "REDACTED TEACHER 2" }
+      ]
+    },
+    "assignments_for_course": {
+      "_count_example": 50,
+      "_note": "Use for /pulse §1 (schedule drift: compare created_at vs due_at), /pulse §2 (grading speed via /submissions/self), /assignments today|week|missed, etc.",
+      "_sample_fields": ["id", "name", "due_at", "unlock_at", "lock_at", "created_at", "updated_at", "points_possible", "grading_type", "assignment_group_id", "workflow_state", "has_submitted_submissions"]
+    }
+  },
+
+  "baseline_ready_json_template": {
+    "_description": "This is the exact shape to write into state/ready.json when the Canvas probe succeeds. Skyward fields come from the Skyward probe and get merged in.",
+    "verified_at": "2026-04-20T14:30:00Z",
+    "student": {
+      "name": "WESTON DAVENPORT",
+      "canvas_user_id": 3886973,
+      "school_hint": "canyons",
+      "grade_level_hint": "10 (derived from course codes containing '10' or '10th')",
+      "active_courses": [
+        "SECONDARY MATH 3 -KENNEDY",
+        "LANGUAGE ARTS 10-BRANNAN",
+        "SPANISH 2-GONZALEZ"
+      ],
+      "teachers_by_course": {
+        "SECONDARY MATH 3 -KENNEDY": ["REDACTED TEACHER 1", "REDACTED TEACHER 2"]
+      }
+    },
+    "canvas": {
+      "url": "https://canyons.instructure.com",
+      "probe_at": "2026-04-20T14:30:00Z",
+      "identity_probe_ok": true,
+      "course_count": 8,
+      "curriculum_probe": {
+        "course_id": 1907705,
+        "course_name": "SECONDARY MATH 3 -KENNEDY",
+        "module_count": 4,
+        "total_item_count": 37
+      }
+    },
+    "skyward": {
+      "url": "https://student.canyonsdistrict.org/scripts/wsisa.dll/WService=wsEAplus/fwemnu01.w",
+      "probe_at": "2026-04-20T14:32:00Z",
+      "login_probe_ok": true,
+      "gradebook_reachable": true,
+      "course_rows_visible": 6
+    }
+  },
+
+  "failure_signatures": {
+    "_description": "Map actual Canvas error responses to honest user-facing messages. Never invent a reason.",
+    "401_unauthorized": {
+      "response_shape": { "errors": [{ "message": "Invalid access token." }] },
+      "user_message": "⚠️ Canvas returned 401 — token looks wrong or expired. Regenerate at **Canvas → Account → Settings → Approved Integrations → + New Access Token** and paste the new one."
+    },
+    "403_forbidden": {
+      "response_shape": { "errors": [{ "message": "..." }] },
+      "user_message": "⚠️ Canvas returned 403 — the token is valid but doesn't have permission to read courses. This usually means the account is restricted. Can you double-check you're using your student account (not a parent observer account)?"
+    },
+    "404_course_not_found": {
+      "user_message": "⚠️ That course ID doesn't exist on your Canvas account — skipping it for this probe and trying the next course."
+    },
+    "network_timeout": {
+      "user_message": "⚠️ Canvas didn't respond in 30s. Might be transient — want me to retry?"
+    }
+  }
+}

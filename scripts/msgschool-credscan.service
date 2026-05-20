@@ -1,0 +1,10 @@
+[Unit]
+Description=msgschool credscan — periodic credential-leak sweep across agent workspaces
+After=msgschool-toolsd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/msgschool-credscan
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true

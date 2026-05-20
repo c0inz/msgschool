@@ -1,0 +1,11 @@
+[Unit]
+Description=msgschool — daily purge of archived workspaces past 30 days
+Requires=msgschool-purge-archived.service
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

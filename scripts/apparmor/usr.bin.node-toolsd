@@ -1,0 +1,105 @@
+#include <tunables/global>
+
+# AppArmor profile for msgschool-toolsd (the platform-owned Canvas /
+# Skyward tool daemon). Started in COMPLAIN mode. Promote with:
+#   sudo aa-enforce /etc/apparmor.d/usr.bin.node-toolsd
+#
+# This is the most security-sensitive profile in the fleet. It pins
+# the daemon to:
+#   - Read encrypted creds from /opt/msgschool/users/*/workspace/credentials/
+#     and tmpfs at /run/msgschool/canvasagent-*/
+#   - Spawn systemd-creds for decrypt
+#   - Spawn the OpenClaw-bundled chromium for Skyward Playwright
+#   - Outbound TLS to *.instructure.com and student.*.org
+#   - Postgres loopback for ms_tool_calls audit
+#
+# What this denies (enforce):
+#   - Writing to credentials/*.json (read-only — toolsd hydrates but
+#     doesn't author; the bot's credential-store does the writes from a
+#     separate mergeCreds path)
+#   - Reading /etc/shadow or other users' home dirs
+#   - exec of anything outside the explicit list
+
+profile toolsd /usr/bin/node flags=(complain) {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+  #include <abstractions/openssl>
+  #include <abstractions/ssl_certs>
+
+  /usr/bin/node                             ix,
+  /usr/bin/sh                               ix,
+
+  # systemd-creds for decrypting the .enc files in toolsd memory
+  /usr/bin/systemd-creds                    ix,
+
+  # OpenClaw's bundled chromium (path comes from MSGSCHOOL_CHROMIUM_PATH env)
+  /root/.cache/ms-playwright/**             rix,
+
+  # Project tree — read source, no writes
+  /var/www/msgschool/                       r,
+  /var/www/msgschool/src/**                 r,
+  /var/www/msgschool/node_modules/**        r,
+  /var/www/msgschool/package.json           r,
+  /var/www/msgschool/.next/**               r,
+
+  # Env file (DATABASE_URL for audit insert pool)
+  /etc/msgschool/.env                       r,
+
+  # Workspace credential files — read encrypted, write tmpfs plaintext
+  /opt/msgschool/users/                     r,
+  /opt/msgschool/users/*/                   r,
+  /opt/msgschool/users/*/workspace/         r,
+  /opt/msgschool/users/*/workspace/credentials/ r,
+  /opt/msgschool/users/*/workspace/credentials/*.json.enc r,
+
+  # tmpfs plaintext + socket
+  /run/msgschool/                           rw,
+  /run/msgschool/toolsd.sock                rw,
+  /run/msgschool/canvasagent-*/             rw,
+  /run/msgschool/canvasagent-*/*.json       rw,
+
+  # Postgres loopback
+  /var/run/postgresql/.s.PGSQL.5432         rw,
+
+  # Standard reads
+  /etc/passwd                               r,
+  /etc/group                                r,
+  /etc/hosts                                r,
+  /etc/resolv.conf                          r,
+  /etc/ssl/**                               r,
+  /usr/lib/**                               r,
+  /usr/share/**                             r,
+  /proc/sys/kernel/random/uuid              r,
+  /proc/sys/kernel/random/boot_id           r,
+  /proc/cpuinfo                             r,
+  /proc/*/status                            r,
+  /sys/devices/system/cpu/                  r,
+  /sys/devices/system/cpu/online            r,
+
+  # tmp for chromium scratch (Playwright launches with private working dir)
+  /tmp/                                     rw,
+  /tmp/**                                   rw,
+
+  # Network: TLS to Canvas + Skyward; loopback to pg + the unix socket
+  network inet  stream,
+  network inet6 stream,
+  network unix  stream,
+  deny network raw,
+  deny network packet,
+
+  capability dac_read_search,
+  deny capability sys_admin,
+  deny capability net_admin,
+  deny capability net_raw,
+  deny capability sys_module,
+  deny capability sys_ptrace,
+
+  ptrace (read,readby) peer=toolsd,
+  deny ptrace,
+
+  # Hard denies
+  deny /etc/shadow                          r,
+  deny /root/.ssh/**                        r,
+  deny /home/**/.ssh/**                     r,
+  deny /home/**/.config/**                  r,
+}

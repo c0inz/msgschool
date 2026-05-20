@@ -1,0 +1,78 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Inter", sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", "Menlo", monospace;
+}
+
+:root {
+  --background: #ffffff;
+  --foreground: #0a0a0a;
+  --muted: #6b6b6b;
+  --border: #111111;
+  --accent: #0a0a0a;
+}
+
+html,
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  border-color: var(--border);
+}
+
+/* Subtle dotted background, neo-brutalist hint. */
+.dots-bg {
+  background-image: radial-gradient(rgba(0, 0, 0, 0.08) 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+
+/* High-contrast button. */
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.875rem 1.5rem;
+  background: #0a0a0a;
+  color: #ffffff;
+  font-weight: 600;
+  font-size: 0.95rem;
+  border: 2px solid #0a0a0a;
+  transition: transform 0.08s ease, background 0.12s ease;
+}
+.btn-primary:hover {
+  background: #ffffff;
+  color: #0a0a0a;
+  transform: translate(-2px, -2px);
+  box-shadow: 4px 4px 0 #0a0a0a;
+}
+
+.btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.875rem 1.5rem;
+  background: transparent;
+  color: #0a0a0a;
+  font-weight: 600;
+  font-size: 0.95rem;
+  border: 2px solid #0a0a0a;
+  transition: transform 0.08s ease, background 0.12s ease;
+}
+.btn-secondary:hover {
+  background: #0a0a0a;
+  color: #ffffff;
+}
+
+/* Section numbering strip (01, 02, 03...). */
+.phase-number {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+}

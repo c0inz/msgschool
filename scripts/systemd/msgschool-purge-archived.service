@@ -1,0 +1,10 @@
+[Unit]
+Description=msgschool — purge archived workspaces past 30 days
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/var/www/msgschool/scripts/purge-archived.sh
+User=root
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run msgschool-credscan every 2 minutes
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=120s
+AccuracySec=15s
+Unit=msgschool-credscan.service
+
+[Install]
+WantedBy=timers.target

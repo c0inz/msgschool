@@ -1,0 +1,27 @@
+[Unit]
+Description=msgschool-toolsd — Canvas / Skyward tool daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/var/www/msgschool
+EnvironmentFile=/etc/msgschool/.env
+Environment=NODE_ENV=production
+Environment=MSGSCHOOL_TOOLSD_SOCKET=/run/msgschool/toolsd.sock
+Environment=MSGSCHOOL_CRED_TMPFS_ROOT=/run/msgschool
+# Use OpenClaw's bundled chromium binary — installed by bootstrap-droplet.sh.
+Environment=MSGSCHOOL_CHROMIUM_PATH=/root/.cache/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-linux64/chrome-headless-shell
+RuntimeDirectory=msgschool
+RuntimeDirectoryMode=0755
+ExecStart=/usr/bin/node --experimental-strip-types /var/www/msgschool/src/lib/toolsd/server.ts
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
